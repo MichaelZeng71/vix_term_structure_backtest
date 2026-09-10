@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Regenerable bulk results (summaries + charts in results/ ARE committed)
+results/*.csv
+results/*.json
+
+# Local / secret
+.env
+*.key
+*.pem
+ibkr_config*.yaml
+ledger_live*.csv
+
+# OS
+.DS_Store
