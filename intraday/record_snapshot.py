@@ -6,7 +6,11 @@ Idempotent on ts_pt: re-running with the same --ts upserts the DB row
 
 Example:
     python3 record_snapshot.py --ts '2026-09-16T06:30:00-07:00' --vix 16.97 \\
-        --curve '{"Oct":18.43,"Nov":18.96}' --source volchart_screenshot
+        --curve '{"Oct":{"last":18.43,"bid":18.38,"ask":18.48},"Nov":18.96}' \\
+        --source volchart_screenshot
+
+Each month value is either a Last-only float (legacy) or an object with
+last/bid/ask (the thesis 'prediction > ask' rule needs the book).
 """
 import argparse
 import csv
@@ -56,6 +60,16 @@ def main() -> None:
     curve = json.loads(a.curve)
     if not isinstance(curve, dict) or not curve:
         ap.error("--curve must be a non-empty JSON object")
+    for label, v in curve.items():
+        if isinstance(v, dict):
+            try:
+                last, bid, ask = float(v["last"]), float(v["bid"]), float(v["ask"])
+            except (KeyError, TypeError, ValueError):
+                ap.error(f"--curve['{label}'] must have numeric last/bid/ask")
+            if not (last > 0 and bid > 0 and ask >= bid):
+                ap.error(f"--curve['{label}']: need last>0, bid>0, ask>=bid")
+        elif not isinstance(v, (int, float)) or v <= 0:
+            ap.error(f"--curve['{label}'] must be a positive price or a last/bid/ask object")
 
     db.upsert_snapshot(a.ts, a.vix, curve, a.source)
     appended = append_csv(a.ts, a.vix, curve)

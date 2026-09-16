@@ -1,74 +1,215 @@
 #!/usr/bin/env python3
-"""Two-version VX futures simulation over screenshot snapshots from db.py.
+"""Thesis-rule VX futures simulation over screenshot snapshots from db.py.
 
-Universe: front-month VX = first key of the curve dict (insertion order);
-slope = F2 - F1. Costs: 1-tick spread ($50) + $4 fees = $54 per flip;
+2026-09-16: signal changed from slope mean-reversion to the thesis rule.
+The slope versions are preserved in git history; the experiment now tests
+the thesis strategy forward.
+
+Signal (thesis 'prediction > ask' rule): each snapshot fits the
+Dupoyet-Daigler-Chen model F(V,dt) = V*A^dt + B*(1-A^dt) by nonlinear least
+squares to spot VIX (dtm=0) + the 8 monthly futures Last prices (t=1
+cross-section, thesis primary spec). Let pred = model price for the front
+month. Target = +1 when pred > ask (lift the ask), -1 when pred < bid (hit
+the bid), else 0 (flat).
+
+Fills at the touch (ask to buy, bid to sell) + $4 fees per flip; the spread
+is in the fill price, not the cost line. Mark-to-market on Last.
 1 contract; $1000 per point. A reversal (long<->short) counts as 2 flips.
 Round-trip win rate is net of each trip's 2 flips.
 
-V1 'close-only': one signal per day from the LAST snapshot of each day.
-    position = -sign(slope - trailing_median(slope, 3 days)), flat for the
-    first 3 days (warmup). Held from one day's close to the next; P&L on
-    front-month price change.
-V2 'intraday': evaluated at EVERY snapshot against the trailing median of
-    slope over the last 20 snapshots (flat until 20-snapshot warmup); trades
-    only on sign flips of the target position; flattened at each day's last
-    snapshot (no overnight).
-V3 'intraday + dead-band': V2 logic, but the target must clear a no-trade
-    buffer (Phase 2c analog of the thesis's 'prediction > ask' rule): only
-    enter/flip when |slope - trailing median| exceeds DEADBAND_PTS; flatten
-    when the signal falls back inside the band.
-V4 'close-only + dead-band': V1 logic with the same dead-band applied to the
-    daily signal (3-day median warmup).
+Snapshots without front-month bid/ask (Last-only legacy rows) are skipped:
+the thesis rule cannot be evaluated without the book.
+
+V1 'close-only': one signal per day from the LAST snapshot of each day,
+held from one day's close to the next; P&L on front-month Last change.
+V2 'intraday': evaluated at EVERY snapshot; flattened at each day's last
+snapshot (no overnight).
+V3 'intraday + dead-band': V2 logic, but the edge must clear a no-trade
+buffer beyond the touch: enter/flip only when pred - ask > BAND (long) or
+bid - pred > BAND (short); flatten inside the band.
+V4 'close-only + dead-band': V1 logic with the same dead-band on the daily
+signal.
 
 Run:  python3 simulate.py
 """
-import statistics
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db
 
 USD_PER_POINT = 1000.0
-FLIP_COST_USD = 54.0  # $50 one-tick spread + $4 fees
-FLIP_COST_POINTS = FLIP_COST_USD / USD_PER_POINT
+FLIP_FEE_USD = 4.0  # per flip; spread is captured by filling at the touch
+FLIP_FEE_POINTS = FLIP_FEE_USD / USD_PER_POINT
 
-V1_WARMUP_DAYS = 3
-V2_WARMUP_SNAPS = 20
-
-# Dead-band half-width on the (slope - trailing median) signal, in price points.
-# Data are delayed VolChart mids with no bid/ask, so the thesis Phase 2c
-# 'prediction > ask' rule is implemented as: the prediction must beat the
-# reference median by more than this buffer before entering/flipping, and the
-# position flattens when the signal falls back inside the band.
-# Default 0.05 = one VX tick ($50 at $1000/pt) — the full assumed spread in
-# the cost model — and ~1.8x the observed typical 30-min |Δslope| (~0.028
-# from early VolChart snapshots), covering the observed noise envelope.
+# Dead-band half-width on the edge beyond the touch, in price points.
+# Default 0.05 = one VX tick ($50 at $1000/pt).
 DEADBAND_PTS = 0.05
 
-
-def sign(x: float) -> int:
-    return 1 if x > 0 else (-1 if x < 0 else 0)
-
-
-def deadband_target(signal_raw: float, band: float = DEADBAND_PTS) -> int:
-    """Phase 2c target: +1 when the prediction is below the reference by more
-    than the band, -1 when above by more than the band, 0 (flat) inside."""
-    if signal_raw > band:
-        return -1
-    if signal_raw < -band:
-        return 1
-    return 0
+MONTHS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
 
 
-def f1_f2(curve: dict):
-    keys = list(curve.keys())
-    f1 = curve[keys[0]]
-    f2 = curve[keys[1]] if len(keys) > 1 else f1
-    return f1, f2
+# --------------------------------------------------------------------------
+# VX expiry calendar: the Wednesday 30 calendar days before the third Friday
+# of the month immediately following the contract month.
+# --------------------------------------------------------------------------
+def vx_expiry(contract_year: int, contract_month: int) -> date:
+    y, m = contract_year, contract_month + 1
+    if m > 12:
+        m, y = 1, y + 1
+    first = date(y, m, 1)
+    third_friday = first + timedelta(days=(4 - first.weekday()) % 7 + 14)
+    return third_friday - timedelta(days=30)
 
 
+def contract_ym(label: str, snap_date: date):
+    m = MONTHS[label]
+    y = snap_date.year if m >= snap_date.month else snap_date.year + 1
+    return y, m
+
+
+# --------------------------------------------------------------------------
+# Dupoyet-Daigler-Chen fit by Nelder-Mead (stdlib only).
+# --------------------------------------------------------------------------
+def ddc_price(spot: float, A: float, B: float, dtm: float) -> float:
+    return spot * (A ** dtm) + B * (1.0 - A ** dtm)
+
+
+def _nelder_mead(obj, x0, step, max_iter=1000, tol=1e-12):
+    n = len(x0)
+    simplex = [list(x0)]
+    for i in range(n):
+        p = list(x0)
+        p[i] += step[i]
+        simplex.append(p)
+    vals = [obj(p) for p in simplex]
+    for _ in range(max_iter):
+        order = sorted(range(n + 1), key=lambda i: vals[i])
+        simplex = [simplex[i] for i in order]
+        vals = [vals[i] for i in order]
+        # centroid of all but worst
+        centroid = [sum(simplex[i][j] for i in range(n)) / n for j in range(n)]
+        worst, best = simplex[n], simplex[0]
+        # reflect
+        xr = [centroid[j] + (centroid[j] - worst[j]) for j in range(n)]
+        fr = obj(xr)
+        if fr < vals[0]:
+            xe = [centroid[j] + 2.0 * (xr[j] - centroid[j]) for j in range(n)]
+            fe = obj(xe)
+            simplex[n], vals[n] = (xe, fe) if fe < fr else (xr, fr)
+        elif fr < vals[n - 1]:
+            simplex[n], vals[n] = xr, fr
+        else:
+            if fr < vals[n]:
+                simplex[n], vals[n] = xr, fr
+            # contract
+            xc = [centroid[j] + 0.5 * (simplex[n][j] - centroid[j]) for j in range(n)]
+            fc = obj(xc)
+            if fc < vals[n]:
+                simplex[n], vals[n] = xc, fc
+            else:
+                # shrink
+                for i in range(1, n + 1):
+                    simplex[i] = [best[j] + 0.5 * (simplex[i][j] - best[j]) for j in range(n)]
+                    vals[i] = obj(simplex[i])
+        spread = max(abs(vals[i] - vals[0]) for i in range(1, n + 1))
+        if spread < tol:
+            break
+    return simplex[0], vals[0]
+
+
+def fit_ddc(spot: float, lasts: list, dtms: list):
+    """Fit (A, B) by NLS to spot + futures Last prices. Returns (A, B, rmse)
+    or None on failure."""
+    if spot <= 0 or len(lasts) < 2:
+        return None
+    prices = [spot] + list(lasts)
+    ds = [0.0] + [max(0.0, d) for d in dtms]
+
+    def sse(p):
+        A, B = p
+        if not (1e-4 < A < 1.0 - 1e-9 and 1e-2 <= B <= 300.0):
+            return 1e18
+        err = 0.0
+        for y, d in zip(prices, ds):
+            err += (ddc_price(spot, A, B, d) - y) ** 2
+        return err
+
+    try:
+        (A, B), best = _nelder_mead(sse, [0.99, 20.0], [0.005, 2.0])
+    except Exception:
+        return None
+    if best >= 1e18 or not (1e-4 < A < 1.0 - 1e-9 and 1e-2 <= B <= 300.0):
+        return None
+    rmse = (best / len(prices)) ** 0.5
+    return A, B, rmse
+
+
+# --------------------------------------------------------------------------
+# Snapshot parsing + thesis signal
+# --------------------------------------------------------------------------
+def _quote(curve: dict, label: str):
+    """Return (last, bid, ask) for a month label; None if legacy Last-only."""
+    v = curve[label]
+    if isinstance(v, dict):
+        try:
+            return float(v["last"]), float(v["bid"]), float(v["ask"])
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None  # legacy plain-float row: no book
+
+
+def _last(curve: dict, label: str) -> float:
+    v = curve[label]
+    return float(v["last"]) if isinstance(v, dict) else float(v)
+
+
+def thesis_signal(snap: dict, band: float = 0.0):
+    """Thesis-rule target for one snapshot.
+
+    Returns (target, info) where info carries pred/bid/ask/A/B/rmse, or
+    (None, None) when the snapshot lacks a front-month book (skipped).
+    """
+    curve = snap["curve"]
+    labels = list(curve.keys())
+    if not labels:
+        return None, None
+    front = labels[0]
+    q = _quote(curve, front)
+    if q is None:
+        return None, None
+    last_f, bid, ask = q
+    if not (bid > 0 and ask >= bid):
+        return None, None
+    snap_date = date.fromisoformat(snap["ts_pt"][:10])
+    lasts, dtms = [], []
+    for lab in labels:
+        lasts.append(_last(curve, lab))
+        y, m = contract_ym(lab, snap_date)
+        dtms.append((vx_expiry(y, m) - snap_date).days)
+    fit = fit_ddc(snap["vix"], lasts, dtms)
+    if fit is None:
+        return 0, {"pred": None, "bid": bid, "ask": ask, "last": last_f,
+                   "A": None, "B": None, "rmse": None, "fit_ok": False}
+    A, B, rmse = fit
+    pred = ddc_price(snap["vix"], A, B, max(0.0, dtms[0]))
+    if pred - ask > band:
+        target = 1
+    elif bid - pred > band:
+        target = -1
+    else:
+        target = 0
+    return target, {"pred": pred, "bid": bid, "ask": ask, "last": last_f,
+                    "A": A, "B": B, "rmse": rmse, "fit_ok": True}
+
+
+# --------------------------------------------------------------------------
+# Bookkeeping: position, flip fees, round trips, drawdown
+# --------------------------------------------------------------------------
 def base_result(version, n_days, n_snaps, note=""):
     return {
         "version": version,
@@ -86,17 +227,17 @@ def base_result(version, n_days, n_snaps, note=""):
 
 
 class Sim:
-    """Shared bookkeeping: position, flip costs, round trips, drawdown."""
+    """Shared bookkeeping. Fills at the touch; fees per flip."""
 
     def __init__(self):
         self.pos = 0
         self.flips = 0
-        self.eq_points = 0.0  # net equity, in points
+        self.eq_points = 0.0
         self.peak_points = 0.0
         self.maxdd_points = 0.0
-        self.trips = []  # net pnl (points) per completed round trip
-        self.open_trip = None  # (entry_f1, pos)
-        self.day_pnl = {}  # date -> net points
+        self.trips = []
+        self.open_trip = None  # (entry_price, pos)
+        self.day_pnl = {}
 
     def _bump_dd(self):
         if self.eq_points > self.peak_points:
@@ -105,22 +246,24 @@ class Sim:
         if dd > self.maxdd_points:
             self.maxdd_points = dd
 
-    def set_target(self, target: int, price: float, date: str):
-        """Move to target at `price`; charges flips; maintains round trips."""
+    def set_target(self, target: int, date: str, close_px: float, open_px: float = None):
+        """Move to target: close any open trip at close_px, open at open_px."""
         if target == self.pos:
             return
-        if self.pos != 0:  # close the open trip at this price
+        if open_px is None:
+            open_px = close_px
+        if self.pos != 0:
             entry, p = self.open_trip
-            self.trips.append(p * (price - entry) - 2 * FLIP_COST_POINTS)
+            self.trips.append(p * (close_px - entry) - 2 * FLIP_FEE_POINTS)
             self.open_trip = None
         flips = 1 if (self.pos == 0 or target == 0) else 2
         self.flips += flips
-        cost = flips * FLIP_COST_POINTS
+        cost = flips * FLIP_FEE_POINTS
         self.eq_points -= cost
         self.day_pnl[date] = self.day_pnl.get(date, 0.0) - cost
         self._bump_dd()
         if target != 0:
-            self.open_trip = (price, target)
+            self.open_trip = (open_px, target)
         self.pos = target
 
     def accrue(self, d_points: float, date: str):
@@ -145,232 +288,132 @@ class Sim:
         return r
 
 
-def run_v1(snaps):
-    """Close-only: daily signal from each day's last snapshot."""
-    by_date = {}
-    for s in snaps:  # ascending; last snapshot of the day wins
-        by_date[s["ts_pt"][:10]] = s
-    days = sorted(by_date.items())
-    n_days, n_snaps = len(days), len(snaps)
-    if n_days < 2:
-        return base_result(
-            "v1_close_only", n_days, n_snaps,
-            note="insufficient data: need at least 2 daily closes",
-        )
-    f1s, slopes = [], []
-    for _, s in days:
-        f1, f2 = f1_f2(s["curve"])
-        f1s.append(f1)
-        slopes.append(f2 - f1)
-
-    sim = Sim()
-    for i, (date, _) in enumerate(days):
-        if i < V1_WARMUP_DAYS:
-            target = 0
-        else:
-            med = statistics.median(slopes[i - V1_WARMUP_DAYS : i])
-            target = -sign(slopes[i] - med)
-        sim.set_target(target, f1s[i], date)
-        if i < n_days - 1:  # hold to next day's close; P&L attributed to that day
-            sim.accrue(sim.pos * (f1s[i + 1] - f1s[i]), days[i + 1][0])
-
-    per_day = [
-        {
-            "date": d,
-            "pnl_points": round(sim.day_pnl.get(d, 0.0), 6),
-            "pnl_usd": round(sim.day_pnl.get(d, 0.0) * USD_PER_POINT, 2),
-        }
-        for d, _ in days
-    ]
-    note = ""
-    if sim.pos != 0:
-        note = "1 open position at end (marked to market through last close)"
-    elif n_days <= V1_WARMUP_DAYS:
-        note = f"all {n_days} day(s) inside {V1_WARMUP_DAYS}-day warmup: flat"
-    return sim.result("v1_close_only", n_days, n_snaps, per_day, note)
+def fill_prices(cur_pos: int, target: int, bid: float, ask: float):
+    """(close_px, open_px) for a position transition, filling at the touch."""
+    if target == 1:
+        open_px = ask
+    elif target == -1:
+        open_px = bid
+    else:
+        open_px = None
+    if cur_pos == 1:
+        close_px = bid
+    elif cur_pos == -1:
+        close_px = ask
+    else:
+        close_px = open_px
+    return close_px, open_px
 
 
-def run_v2(snaps):
-    """Intraday: signal at every snapshot, flattened at each day's close."""
-    n = len(snaps)
-    dates = [s["ts_pt"][:10] for s in snaps]
-    n_days = len(set(dates))
-    if n < 2:
-        return base_result(
-            "v2_intraday", n_days, n,
-            note="insufficient data: need at least 2 snapshots",
-        )
-    f1s, slopes = [], []
+def usable_snaps(snaps, band):
+    """Snapshots with a computable thesis signal, in time order."""
+    rows, skipped = [], 0
     for s in snaps:
-        f1, f2 = f1_f2(s["curve"])
-        f1s.append(f1)
-        slopes.append(f2 - f1)
+        target, info = thesis_signal(s, band)
+        if target is None:
+            skipped += 1
+            continue
+        rows.append((s, target, info))
+    return rows, skipped
 
-    sim = Sim()
-    for i in range(n):
-        date = dates[i]
-        last_of_day = (i == n - 1) or (dates[i + 1] != date)
-        if last_of_day or i < V2_WARMUP_SNAPS:
-            target = 0
-        else:
-            med = statistics.median(slopes[i - V2_WARMUP_SNAPS : i])
-            target = -sign(slopes[i] - med)
-        sim.set_target(target, f1s[i], date)
-        if i < n - 1:
-            # no overnight: position is 0 across day boundaries by construction
-            sim.accrue(sim.pos * (f1s[i + 1] - f1s[i]), date)
 
-    per_day = [
+def per_day_table(day_pnl, days):
+    return [
         {
             "date": d,
-            "pnl_points": round(sim.day_pnl.get(d, 0.0), 6),
-            "pnl_usd": round(sim.day_pnl.get(d, 0.0) * USD_PER_POINT, 2),
+            "pnl_points": round(day_pnl.get(d, 0.0), 6),
+            "pnl_usd": round(day_pnl.get(d, 0.0) * USD_PER_POINT, 2),
         }
-        for d in sorted(set(dates))
+        for d in days
     ]
-    note = ""
-    if n <= V2_WARMUP_SNAPS:
-        note = f"all {n} snapshot(s) inside {V2_WARMUP_SNAPS}-snapshot warmup: flat"
-    return sim.result("v2_intraday", n_days, n, per_day, note)
+
+
+def skip_note(skipped, extra=""):
+    note = f"{skipped} snapshot(s) skipped: Last-only, no bid/ask" if skipped else ""
+    return f"{note}; {extra}".strip("; ") if extra else note
+
+
+# --------------------------------------------------------------------------
+# Versions
+# --------------------------------------------------------------------------
+def run_v1(snaps, band=0.0, version="v1_close_only"):
+    """Close-only thesis rule: signal from each day's last snapshot."""
+    rows, skipped = usable_snaps(snaps, band)
+    by_date = {}
+    for s, target, info in rows:  # ascending; last snapshot of the day wins
+        by_date[s["ts_pt"][:10]] = (s, target, info)
+    days = sorted(by_date.items())
+    n_days = len(days)
+    if n_days < 1:
+        return base_result(version, 0, 0,
+                           note=skip_note(skipped, "insufficient data: no usable snapshots"))
+    sim = Sim()
+    for i, (d, (s, target, info)) in enumerate(days):
+        cpx, opx = fill_prices(sim.pos, target, info["bid"], info["ask"])
+        sim.set_target(target, d, cpx, opx)
+        if i < n_days - 1:  # hold to next day's close; P&L on Last change
+            nxt = days[i + 1][1][2]
+            sim.accrue(sim.pos * (nxt["last"] - info["last"]), days[i + 1][0])
+    note = skip_note(skipped)
+    if sim.pos != 0:
+        note = (note + "; " if note else "") + "1 open position at end (marked on Last)"
+    return sim.result(version, n_days, len(rows),
+                      per_day_table(sim.day_pnl, [d for d, _ in days]), note)
+
+
+def run_v2(snaps, band=0.0, version="v2_intraday"):
+    """Intraday thesis rule: every snapshot, flattened at each day's close."""
+    rows, skipped = usable_snaps(snaps, band)
+    n = len(rows)
+    if n < 1:
+        return base_result(version, 0, 0,
+                           note=skip_note(skipped, "insufficient data: no usable snapshots"))
+    dates = [s["ts_pt"][:10] for s, _, _ in rows]
+    n_days = len(set(dates))
+    sim = Sim()
+    for i, (s, target, info) in enumerate(rows):
+        d = dates[i]
+        last_of_day = (i == n - 1) or (dates[i + 1] != d)
+        tgt = 0 if last_of_day else target
+        cpx, opx = fill_prices(sim.pos, tgt, info["bid"], info["ask"])
+        sim.set_target(tgt, d, cpx, opx)
+        if i < n - 1:
+            nxt = rows[i + 1][2]
+            # no overnight: position is 0 across day boundaries by construction
+            sim.accrue(sim.pos * (nxt["last"] - info["last"]), d)
+    note = skip_note(skipped)
+    if band:
+        note = (note + "; " if note else "") + f"dead-band {band} pts"
+    return sim.result(version, n_days, n,
+                      per_day_table(sim.day_pnl, sorted(set(dates))), note)
 
 
 def run_v3(snaps):
-    """Intraday + dead-band: V2 logic, but the target clears a no-trade buffer.
-
-    target = deadband_target(slope - trailing median of last 20 slopes):
-    enter/flip only when the signal exceeds DEADBAND_PTS; flatten when it
-    falls back inside the band. Same 20-snapshot warmup and day-end flatten
-    as V2; same cost model.
-    """
-    n = len(snaps)
-    dates = [s["ts_pt"][:10] for s in snaps]
-    n_days = len(set(dates))
-    if n < 2:
-        return base_result(
-            "v3_intraday_deadband", n_days, n,
-            note="insufficient data: need at least 2 snapshots",
-        )
-    f1s, slopes = [], []
-    for s in snaps:
-        f1, f2 = f1_f2(s["curve"])
-        f1s.append(f1)
-        slopes.append(f2 - f1)
-
-    sim = Sim()
-    for i in range(n):
-        date = dates[i]
-        last_of_day = (i == n - 1) or (dates[i + 1] != date)
-        if last_of_day or i < V2_WARMUP_SNAPS:
-            target = 0
-        else:
-            med = statistics.median(slopes[i - V2_WARMUP_SNAPS : i])
-            target = deadband_target(slopes[i] - med)
-        sim.set_target(target, f1s[i], date)
-        if i < n - 1:
-            sim.accrue(sim.pos * (f1s[i + 1] - f1s[i]), date)
-
-    per_day = [
-        {
-            "date": d,
-            "pnl_points": round(sim.day_pnl.get(d, 0.0), 6),
-            "pnl_usd": round(sim.day_pnl.get(d, 0.0) * USD_PER_POINT, 2),
-        }
-        for d in sorted(set(dates))
-    ]
-    note = f"dead-band {DEADBAND_PTS} pts"
-    if n <= V2_WARMUP_SNAPS:
-        note = (
-            f"all {n} snapshot(s) inside {V2_WARMUP_SNAPS}-snapshot warmup: flat "
-            f"(dead-band {DEADBAND_PTS} pts)"
-        )
-    return sim.result("v3_intraday_deadband", n_days, n, per_day, note)
+    return run_v2(snaps, band=DEADBAND_PTS, version="v3_intraday_deadband")
 
 
 def run_v4(snaps):
-    """Close-only + dead-band: V1 logic with the dead-band on the daily signal.
-
-    One signal per day from the last snapshot; target =
-    deadband_target(slope - trailing median of last 3 days). Same 3-day
-    warmup and daily-rebalance mechanics as V1; same cost model.
-    """
-    by_date = {}
-    for s in snaps:  # ascending; last snapshot of the day wins
-        by_date[s["ts_pt"][:10]] = s
-    days = sorted(by_date.items())
-    n_days, n_snaps = len(days), len(snaps)
-    if n_days < 2:
-        return base_result(
-            "v4_close_deadband", n_days, n_snaps,
-            note="insufficient data: need at least 2 daily closes",
-        )
-    f1s, slopes = [], []
-    for _, s in days:
-        f1, f2 = f1_f2(s["curve"])
-        f1s.append(f1)
-        slopes.append(f2 - f1)
-
-    sim = Sim()
-    for i, (date, _) in enumerate(days):
-        if i < V1_WARMUP_DAYS:
-            target = 0
-        else:
-            med = statistics.median(slopes[i - V1_WARMUP_DAYS : i])
-            target = deadband_target(slopes[i] - med)
-        sim.set_target(target, f1s[i], date)
-        if i < n_days - 1:  # hold to next day's close; P&L attributed to that day
-            sim.accrue(sim.pos * (f1s[i + 1] - f1s[i]), days[i + 1][0])
-
-    per_day = [
-        {
-            "date": d,
-            "pnl_points": round(sim.day_pnl.get(d, 0.0), 6),
-            "pnl_usd": round(sim.day_pnl.get(d, 0.0) * USD_PER_POINT, 2),
-        }
-        for d, _ in days
-    ]
-    note = f"dead-band {DEADBAND_PTS} pts"
-    if sim.pos != 0:
-        note = (
-            f"1 open position at end (marked to market through last close; "
-            f"dead-band {DEADBAND_PTS} pts)"
-        )
-    elif n_days <= V1_WARMUP_DAYS:
-        note = (
-            f"all {n_days} day(s) inside {V1_WARMUP_DAYS}-day warmup: flat "
-            f"(dead-band {DEADBAND_PTS} pts)"
-        )
-    return sim.result("v4_close_deadband", n_days, n_snaps, per_day, note)
+    return run_v1(snaps, band=DEADBAND_PTS, version="v4_close_deadband")
 
 
-def fmt(r):
-    wr = "n/a" if r["win_rate"] is None else f"{r['win_rate']:.1%}"
-    lines = [
-        f"--- {r['version']} ---",
-        f"snapshots: {r['n_snaps']}  days: {r['n_days']}  "
-        f"trades: {r['n_trades']}  flips: {r['n_flips']}",
-        f"P&L: {r['total_pnl_points']:+.4f} pts  ({r['total_pnl_usd']:+.2f} USD)",
-        f"max drawdown: {r['max_drawdown_usd']:.2f} USD   win rate: {wr}",
-    ]
-    if r["note"]:
-        lines.append(f"note: {r['note']}")
-    if r["per_day_pnl"]:
-        lines.append(
-            "per-day P&L (USD): "
-            + ", ".join(f"{d['date']}:{d['pnl_usd']:+.0f}" for d in r["per_day_pnl"])
-        )
-    return "\n".join(lines)
-
-
+# --------------------------------------------------------------------------
 def main():
     snaps = db.get_snapshots()
     print(f"loaded {len(snaps)} snapshot(s) from {db.DB_PATH}\n")
-    print(fmt(run_v1(snaps)))
-    print()
-    print(fmt(run_v2(snaps)))
-    print()
-    print(fmt(run_v3(snaps)))
-    print()
-    print(fmt(run_v4(snaps)))
+    for fn in (run_v1, run_v2, run_v3, run_v4):
+        r = fn(snaps)
+        wr = "n/a" if r["win_rate"] is None else f"{r['win_rate'] * 100:.1f}%"
+        print(f"--- {r['version']} ---")
+        print(f"snapshots: {r['n_snaps']}  days: {r['n_days']}  "
+              f"trades: {r['n_trades']}  flips: {r['n_flips']}")
+        print(f"P&L: {r['total_pnl_points']:+.4f} pts  ({r['total_pnl_usd']:+.2f} USD)")
+        print(f"max drawdown: {r['max_drawdown_usd']:.2f} USD   win rate: {wr}")
+        if r["note"]:
+            print(f"note: {r['note']}")
+        if r["per_day_pnl"]:
+            per = "  ".join(f"{d['date']}:{d['pnl_usd']:+.0f}" for d in r["per_day_pnl"])
+            print(f"per-day P&L (USD): {per}")
+        print()
 
 
 if __name__ == "__main__":
