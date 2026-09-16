@@ -24,11 +24,12 @@ V1 'close-only': one signal per day from the LAST snapshot of each day,
 held from one day's close to the next; P&L on front-month Last change.
 V2 'intraday': evaluated at EVERY snapshot; flattened at each day's last
 snapshot (no overnight).
-V3 'intraday + dead-band': V2 logic, but the edge must clear a no-trade
-buffer beyond the touch: enter/flip only when pred - ask > BAND (long) or
-bid - pred > BAND (short); flatten inside the band.
-V4 'close-only + dead-band': V1 logic with the same dead-band on the daily
-signal.
+
+There is no separate dead-band variant: the bid/ask spread itself is the
+no-trade band. A fixed 0.05-point buffer was briefly tested as V3/V4 and
+removed per Miao on 2026-09-16 — the thesis rule (pred > ask to buy,
+pred < bid to sell) is traded exactly. The `band` parameter on the run
+functions defaults to 0.0 and exists only for future sensitivity checks.
 
 Run:  python3 simulate.py
 """
@@ -43,9 +44,10 @@ USD_PER_POINT = 1000.0
 FLIP_FEE_USD = 4.0  # per flip; spread is captured by filling at the touch
 FLIP_FEE_POINTS = FLIP_FEE_USD / USD_PER_POINT
 
-# Dead-band half-width on the edge beyond the touch, in price points.
-# Default 0.05 = one VX tick ($50 at $1000/pt).
-DEADBAND_PTS = 0.05
+# No hardcoded dead-band: the bid/ask spread itself is the no-trade band.
+# The `band` parameter on the run functions stays at its default 0.0 so an
+# extra buffer can be reintroduced later as a sensitivity check, but no
+# variant uses it — per Miao, the thesis rule is traded exactly.
 
 MONTHS = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
@@ -388,19 +390,11 @@ def run_v2(snaps, band=0.0, version="v2_intraday"):
                       per_day_table(sim.day_pnl, sorted(set(dates))), note)
 
 
-def run_v3(snaps):
-    return run_v2(snaps, band=DEADBAND_PTS, version="v3_intraday_deadband")
-
-
-def run_v4(snaps):
-    return run_v1(snaps, band=DEADBAND_PTS, version="v4_close_deadband")
-
-
 # --------------------------------------------------------------------------
 def main():
     snaps = db.get_snapshots()
     print(f"loaded {len(snaps)} snapshot(s) from {db.DB_PATH}\n")
-    for fn in (run_v1, run_v2, run_v3, run_v4):
+    for fn in (run_v1, run_v2):
         r = fn(snaps)
         wr = "n/a" if r["win_rate"] is None else f"{r['win_rate'] * 100:.1f}%"
         print(f"--- {r['version']} ---")
