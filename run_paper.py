@@ -40,6 +40,7 @@ import sqlite3
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE / "src"))
@@ -114,7 +115,7 @@ def reconcile_positions(current: dict, target: dict,
     return orders
 
 
-def limit_price_for(action: str, bid: float | None, ask: float | None,
+def limit_price_for(action: str, bid: Optional[float], ask: Optional[float],
                     fallback: float) -> float:
     """Marketable limit price: join the touch (BUY at ask, SELL at bid).
 
