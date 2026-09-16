@@ -18,3 +18,6 @@ ledger_live*.csv
 
 # OS
 .DS_Store
+
+# Live/experimental local data (not committed)
+*.db
