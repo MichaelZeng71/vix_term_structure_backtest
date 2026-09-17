@@ -17,7 +17,7 @@ cross-section, thesis primary spec). For EVERY contract: target = +1 when
 that contract's predicted price > its ask (lift the ask), -1 when its
 predicted price < its bid (hit the bid), else 0 (flat).
 
-Fills at the touch (ask to buy, bid to sell) + $4 fees per flip per
+Fills at the touch (ask to buy, bid to sell) + $2 fees per flip per
 contract; the spread is in the fill price, not the cost line.
 Mark-to-market on each contract's Last. 1 contract per month signal;
 $1000 per point. A reversal (long<->short) counts as 2 flips.
