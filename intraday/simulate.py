@@ -391,12 +391,24 @@ def skip_note(skipped, extra=""):
 # Versions
 # --------------------------------------------------------------------------
 def _apply_targets(sim, targets, infos, d, flat=False):
-    """Set per-contract targets; when flat=True force every target to 0."""
+    """Set per-contract targets; when flat=True force every target to 0.
+
+    Fills happen at the touch while positions are marked on Last, so every
+    fill also books its immediate fill-vs-mark edge into equity. That makes
+    equity exactly equal to fill-to-fill trade economics (the trip log):
+    entry edge + Last-to-Last accruals + exit edge - fees.
+    """
     for lab, target in targets.items():
         tgt = 0 if flat else target
         bid, ask = _book(infos[lab])
-        cpx, opx = fill_prices(sim.pos.get(lab, 0), tgt, bid, ask)
+        last = infos[lab]["last"]
+        cur = sim.pos.get(lab, 0)
+        cpx, opx = fill_prices(cur, tgt, bid, ask)
         sim.set_target(lab, tgt, d, cpx, opx)
+        if cur != 0 and tgt != cur:
+            sim.accrue(lab, cur * (cpx - last), d)   # closing leg edge
+        if tgt != 0 and tgt != cur:
+            sim.accrue(lab, tgt * (last - opx), d)   # opening leg edge
 
 
 def run_v1(snaps, band=0.0, version="v1_close_only"):

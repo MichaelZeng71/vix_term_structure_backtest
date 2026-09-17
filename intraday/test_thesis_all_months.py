@@ -11,7 +11,13 @@ are built exactly on a DDC curve (spot 15.0, A=0.99, B=22.0) so the fit
 recovers pred ~= last to ~1e-9; books are placed +/-0.02..0.03 around last
 to force signals with wide margins.
 
-Cost model: $4 per flip per contract = 0.004 pts (1 contract, $1000/pt).
+Cost model: $2 per flip per contract = 0.002 pts (1 contract, $1000/pt).
+Spread is NOT in the fee: fills happen at the touch (buy ask / sell bid)
+while positions are marked on Last, so every fill books an immediate
+fill-vs-mark edge into equity. Equity therefore equals fill-to-fill trade
+economics: entry edge + Last-to-Last accruals + exit edge - fees, which is
+exactly what the closed-trip log records. The hand traces below verify
+both sides agree.
 """
 import sys
 from datetime import date
@@ -81,15 +87,20 @@ def main():
     # NOTE: day2's lasts also roll one day closer to expiry (dtm shrinks),
     # so the day-2 curve is NOT day-1 lasts + drift; the trace below reads
     # the actual lasts out of the snapshots and hand-applies the engine's
-    # accounting (fills at the touch, $4/flip, mark on Last).
-    # Day1: enter long Oct @ ask1 = l1o-0.02; short Nov @ bid1 = l1n+0.02.
-    #   eq = -2*FEE
+    # accounting (fills at the touch, $2/flip, mark on Last, immediate
+    # fill-vs-mark edge into equity).
+    # Day1: enter long Oct @ ask1 = l1o-0.02 -> edge +(l1o-ask1) = +0.02;
+    #       short Nov @ bid1 = l1n+0.02 -> edge -(l1n-bid1) = +0.02.
+    #   eq = 0.04 - 2*FEE
     # Hold to day2 close: Oct accrues +(l2o-l1o); Nov accrues -(l2n-l1n).
-    # Day2: flat signals -> close Oct @ bid2 = l2o-0.03, Nov @ ask2 = l2n+0.03.
+    # Day2: flat signals -> close Oct @ bid2 = l2o-0.03 -> edge -0.03;
+    #       close Nov @ ask2 = l2n+0.03 -> edge -0.03.
     #   trip Oct = (l2o-0.03)-(l1o-0.02)-2*FEE   (> 0: l2o-l1o ~ +0.15)
     #   trip Nov = -((l2n+0.03)-(l1n+0.02))-2*FEE (> 0: l2n-l1n ~ -0.34)
-    #   eq = -2*FEE + (l2o-l1o) - (l2n-l1n) - 2*FEE
-    # flips = 4; maxdd: 0 -> -2*FEE => $8
+    #   eq = 0.04-2*FEE + (l2o-l1o) - (l2n-l1n) - 0.06 - 2*FEE
+    #      = (l2o-l1o) - (l2n-l1n) - 0.02 - 4*FEE  == sum of the two trips
+    # flips = 4; maxdd: path rises monotonically to the day-2 closes, then
+    #   drops 0.06 (edges) + 2*FEE (fees) => (0.06+2*FEE) pts.
     day1 = snap("2026-09-17T13:00:00-07:00", {"Oct": "long", "Nov": "short"})
     day2 = snap("2026-09-18T13:00:00-07:00", {"Oct": "flat", "Nov": "flat"},
                 drift={"Oct": 0.20, "Nov": -0.30})
@@ -97,9 +108,10 @@ def main():
     l1n = day1["curve"]["Nov"]["last"]
     l2o = day2["curve"]["Oct"]["last"]
     l2n = day2["curve"]["Nov"]["last"]
-    exp_eq = -2 * FEE + (l2o - l1o) - (l2n - l1n) - 2 * FEE
-    exp_d2 = (l2o - l1o) - (l2n - l1n) - 2 * FEE
-    exp_dd = round(2 * FEE * 1000, 2)  # peak 0 -> trough -2*FEE
+    exp_eq = (l2o - l1o) - (l2n - l1n) - 0.02 - 4 * FEE
+    exp_d1 = 0.04 - 2 * FEE
+    exp_d2 = (l2o - l1o) - (l2n - l1n) - 0.06 - 2 * FEE
+    exp_dd = round((0.06 + 2 * FEE) * 1000, 2)  # day-2 close edges + fees
     r1 = run_v1([day1, day2])
     check("v1 all-months", r1, {
         "version": "v1_close_only", "n_snaps": 2, "n_days": 2,
@@ -109,16 +121,19 @@ def main():
         "max_drawdown_usd": exp_dd, "win_rate": 1.0,
     })
     per1 = {d["date"]: d["pnl_usd"] for d in r1["per_day_pnl"]}
-    assert per1 == {"2026-09-17": -round(2 * FEE * 1000, 2),
+    assert per1 == {"2026-09-17": round(exp_d1 * 1000, 2),
                     "2026-09-18": round(exp_d2 * 1000, 2)}, per1
     print("OK  v1 per-day attribution:", per1)
 
     # --- V2 hand trace (same day, 2 snapshots) ---
-    # Snap1: enter long Oct @ P_Oct-0.02, short Nov @ P_Nov+0.02 -> eq=-2*FEE
-    # Accrue to snap2: Oct +0.10, Nov +0.10 -> eq = 0.20-2*FEE
-    # Snap2 (last of day): force flat; close Oct @ P_Oct+0.07, Nov @ P_Nov-0.07.
+    # Snap1: enter long Oct @ P_Oct-0.02 -> edge +0.02;
+    #        short Nov @ P_Nov+0.02 -> edge +0.02. eq = 0.04-2*FEE
+    # Accrue to snap2: Oct +0.10, Nov +0.10 -> eq = 0.24-2*FEE
+    # Snap2 (last of day): force flat; close Oct @ P_Oct+0.07 -> edge -0.03;
+    #   close Nov @ P_Nov-0.07 -> edge -0.03; fees -2*FEE.
     #   trip Oct = 0.09-2*FEE; trip Nov = 0.09-2*FEE
-    #   eq = 0.20-4*FEE; flips = 4
+    #   eq = 0.24-2*FEE-0.06-2*FEE = 0.18-4*FEE  == sum of the two trips
+    #   maxdd: peak 0.24-2*FEE, then closes drop 0.06 (edges) + 2*FEE (fees)
     m1 = snap("2026-09-17T06:30:00-07:00", {"Oct": "long", "Nov": "short"})
     m2 = snap("2026-09-17T13:00:00-07:00", {"Oct": "flat", "Nov": "flat"},
               drift={"Oct": 0.10, "Nov": -0.10})
@@ -126,9 +141,9 @@ def main():
     check("v2 all-months", r2, {
         "version": "v2_intraday", "n_snaps": 2, "n_days": 1,
         "n_trades": 2, "n_flips": 4,
-        "total_pnl_points": round(0.20 - 4 * FEE, 6),
-        "total_pnl_usd": round((0.20 - 4 * FEE) * 1000, 2),
-        "max_drawdown_usd": round(2 * FEE * 1000, 2), "win_rate": 1.0,
+        "total_pnl_points": round(0.18 - 4 * FEE, 6),
+        "total_pnl_usd": round((0.18 - 4 * FEE) * 1000, 2),
+        "max_drawdown_usd": round((0.06 + 2 * FEE) * 1000, 2), "win_rate": 1.0,
     })
 
     # --- skip rules ---
