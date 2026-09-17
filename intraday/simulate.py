@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db
 
 USD_PER_POINT = 1000.0
-FLIP_FEE_USD = 4.0  # per flip per contract; spread is captured by filling at the touch
+FLIP_FEE_USD = 2.0  # per flip per contract; spread is captured by filling at the touch
 FLIP_FEE_POINTS = FLIP_FEE_USD / USD_PER_POINT
 
 # No hardcoded dead-band: each contract's bid/ask spread is the no-trade band.

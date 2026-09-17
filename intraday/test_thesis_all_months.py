@@ -99,25 +99,26 @@ def main():
     l2n = day2["curve"]["Nov"]["last"]
     exp_eq = -2 * FEE + (l2o - l1o) - (l2n - l1n) - 2 * FEE
     exp_d2 = (l2o - l1o) - (l2n - l1n) - 2 * FEE
+    exp_dd = round(2 * FEE * 1000, 2)  # peak 0 -> trough -2*FEE
     r1 = run_v1([day1, day2])
     check("v1 all-months", r1, {
         "version": "v1_close_only", "n_snaps": 2, "n_days": 2,
         "n_trades": 2, "n_flips": 4,
         "total_pnl_points": round(exp_eq, 6),
         "total_pnl_usd": round(exp_eq * 1000, 2),
-        "max_drawdown_usd": 8.00, "win_rate": 1.0,
+        "max_drawdown_usd": exp_dd, "win_rate": 1.0,
     })
     per1 = {d["date"]: d["pnl_usd"] for d in r1["per_day_pnl"]}
-    assert per1 == {"2026-09-17": -8.00,
+    assert per1 == {"2026-09-17": -round(2 * FEE * 1000, 2),
                     "2026-09-18": round(exp_d2 * 1000, 2)}, per1
     print("OK  v1 per-day attribution:", per1)
 
     # --- V2 hand trace (same day, 2 snapshots) ---
-    # Snap1: enter long Oct @ P_Oct-0.02, short Nov @ P_Nov+0.02 -> eq=-0.008
-    # Accrue to snap2: Oct +0.10, Nov +0.10 -> eq = 0.192
+    # Snap1: enter long Oct @ P_Oct-0.02, short Nov @ P_Nov+0.02 -> eq=-2*FEE
+    # Accrue to snap2: Oct +0.10, Nov +0.10 -> eq = 0.20-2*FEE
     # Snap2 (last of day): force flat; close Oct @ P_Oct+0.07, Nov @ P_Nov-0.07.
-    #   trip Oct = 0.09-0.008 = 0.082; trip Nov = 0.09-0.008 = 0.082
-    #   eq = 0.192 - 0.008 = 0.184; flips = 4
+    #   trip Oct = 0.09-2*FEE; trip Nov = 0.09-2*FEE
+    #   eq = 0.20-4*FEE; flips = 4
     m1 = snap("2026-09-17T06:30:00-07:00", {"Oct": "long", "Nov": "short"})
     m2 = snap("2026-09-17T13:00:00-07:00", {"Oct": "flat", "Nov": "flat"},
               drift={"Oct": 0.10, "Nov": -0.10})
@@ -125,8 +126,9 @@ def main():
     check("v2 all-months", r2, {
         "version": "v2_intraday", "n_snaps": 2, "n_days": 1,
         "n_trades": 2, "n_flips": 4,
-        "total_pnl_points": 0.184, "total_pnl_usd": 184.00,
-        "max_drawdown_usd": 8.00, "win_rate": 1.0,
+        "total_pnl_points": round(0.20 - 4 * FEE, 6),
+        "total_pnl_usd": round((0.20 - 4 * FEE) * 1000, 2),
+        "max_drawdown_usd": round(2 * FEE * 1000, 2), "win_rate": 1.0,
     })
 
     # --- skip rules ---
