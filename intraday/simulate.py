@@ -29,8 +29,10 @@ flat (0) target for that snapshot.
 
 V1 'close-only': one signal per day from the LAST snapshot of each day,
 held from one day's close to the next; P&L on each contract's Last change.
-V2 'intraday': evaluated at EVERY snapshot; all positions flattened at
-each day's last snapshot (no overnight).
+V2 'intraday': evaluated at EVERY snapshot; positions are carried until the
+target flips or goes flat — including across day boundaries when the
+deviation between predicted and market price persists (no forced
+end-of-day flatten, per Miao 2026-09-18).
 
 There is no separate dead-band variant: each contract's bid/ask spread is
 the no-trade band. A fixed 0.05-point buffer was briefly tested as V3/V4
@@ -443,8 +445,12 @@ def run_v1(snaps, band=0.0, version="v1_close_only"):
 
 
 def run_v2(snaps, band=0.0, version="v2_intraday"):
-    """Intraday thesis rule, all months: every snapshot; all positions
-    flattened at each day's last snapshot (no overnight)."""
+    """Intraday thesis rule, all months: signal evaluated at EVERY snapshot;
+    positions are carried until the target flips or goes flat — including
+    across day boundaries when the predicted-vs-book deviation persists
+    (no forced end-of-day flatten, per Miao 2026-09-18). P&L accrues on each
+    contract's Last change between snapshots, attributed to the later
+    snapshot's day."""
     rows, skipped = usable_snaps(snaps, band)
     n = len(rows)
     if n < 1:
@@ -455,19 +461,21 @@ def run_v2(snaps, band=0.0, version="v2_intraday"):
     sim = Sim()
     for i, (s, targets, infos) in enumerate(rows):
         d = dates[i]
-        last_of_day = (i == n - 1) or (dates[i + 1] != d)
-        _apply_targets(sim, targets, infos, d, flat=last_of_day)
+        _apply_targets(sim, targets, infos, d)
         if i < n - 1:
             nxt_infos = rows[i + 1][2]
-            # no overnight: positions are 0 across day boundaries by construction
+            nxt_d = dates[i + 1]
             for lab in targets:
                 if lab in nxt_infos and sim.pos.get(lab, 0) != 0:
                     sim.accrue(lab,
                                sim.pos[lab] * (nxt_infos[lab]["last"] - infos[lab]["last"]),
-                               d)
+                               nxt_d)
     note = skip_note(skipped)
     if band:
         note = (note + "; " if note else "") + f"dead-band {band} pts"
+    open_n = sum(1 for p in sim.pos.values() if p != 0)
+    if open_n:
+        note = (note + "; " if note else "") + f"{open_n} open position(s) at end (marked on Last)"
     return sim.result(version, n_days, n,
                       per_day_table(sim.day_pnl, sorted(set(dates))), note)
 

@@ -30,7 +30,7 @@ from simulate import (
 )
 
 SPOT, A_TRUE, B_TRUE = 15.0, 0.99, 22.0
-FEE = FLIP_FEE_POINTS  # 0.004
+FEE = FLIP_FEE_POINTS  # 0.002 ($2 per flip per contract)
 
 
 def dtm(snap_day: date, label: str) -> int:
@@ -145,6 +145,57 @@ def main():
         "total_pnl_usd": round((0.18 - 4 * FEE) * 1000, 2),
         "max_drawdown_usd": round((0.06 + 2 * FEE) * 1000, 2), "win_rate": 1.0,
     })
+
+    # --- V2 carry-across-days (2026-09-18 rule change) ---
+    # Miao: V2 no longer force-flattens at end of day. When the predicted-vs-
+    # book deviation persists, the position carries into the next day and only
+    # exits when the target flips or goes flat.
+    # c1 (day1 06:30): enter long Oct @ ask=l1o-0.02 -> edge +0.02;
+    #                   short Nov @ bid=l1n+0.02 -> edge +0.02.
+    #   eq = 0.04 - 2*FEE
+    # Accrue c1->c2 (overnight): Oct +(l2o-l1o); Nov -(l2n-l1n). c2 signals
+    #   still long/short -> hold, no flips.
+    # Accrue c2->c3 (intraday): Oct +(l3o-l2o); Nov -(l3n-l2n). c3 flat ->
+    #   close Oct @ bid3=l3o-0.03 -> edge -0.03; close Nov @ ask3=l3n+0.03
+    #   -> edge -0.03; fees -2*FEE.
+    # trip Oct = (l3o-0.03)-(l1o-0.02)-2*FEE
+    # trip Nov = -((l3n+0.03)-(l1n+0.02))-2*FEE
+    # eq = 0.04-2*FEE + (l3o-l1o) - (l3n-l1n) - 0.06 - 2*FEE   (accruals
+    #      telescope across the day boundary)
+    #    = (l3o-l1o) - (l3n-l1n) - 0.02 - 4*FEE == sum of the two trips
+    # Drifts are large enough that both legs gain on every segment, so the
+    # equity path rises monotonically to just before the c3 closes, then
+    # drops 0.06 (exit edges) + 2*FEE (fees): maxdd = (0.06+2*FEE) pts.
+    c1 = snap("2026-09-17T06:30:00-07:00", {"Oct": "long", "Nov": "short"})
+    c2 = snap("2026-09-18T06:30:00-07:00", {"Oct": "long", "Nov": "short"},
+              drift={"Oct": 0.30, "Nov": -0.30})
+    c3 = snap("2026-09-18T13:00:00-07:00", {"Oct": "flat", "Nov": "flat"},
+              drift={"Oct": 0.40, "Nov": -0.40})
+    l1o = c1["curve"]["Oct"]["last"]
+    l1n = c1["curve"]["Nov"]["last"]
+    l2o = c2["curve"]["Oct"]["last"]
+    l2n = c2["curve"]["Nov"]["last"]
+    l3o = c3["curve"]["Oct"]["last"]
+    l3n = c3["curve"]["Nov"]["last"]
+    assert (l2o - l1o) > 0 and (l2n - l1n) < 0, "carry test needs both legs gaining overnight"
+    assert (l3o - l2o) > 0 and (l3n - l2n) < 0, "carry test needs both legs gaining intraday"
+    exp_carry = (l3o - l1o) - (l3n - l1n) - 0.02 - 4 * FEE
+    r3 = run_v2([c1, c2, c3])
+    check("v2 carry-across-days", r3, {
+        "version": "v2_intraday", "n_snaps": 3, "n_days": 2,
+        "n_trades": 2, "n_flips": 4,
+        "total_pnl_points": round(exp_carry, 6),
+        "total_pnl_usd": round(exp_carry * 1000, 2),
+        "max_drawdown_usd": round((0.06 + 2 * FEE) * 1000, 2), "win_rate": 1.0,
+    })
+    # overnight accrual lands on the later snapshot's day
+    per3 = {d["date"]: d["pnl_usd"] for d in r3["per_day_pnl"]}
+    exp_c1 = 0.04 - 2 * FEE                      # day1: entry edges + fees
+    exp_c2 = (l2o - l1o) - (l2n - l1n)           # day2: overnight accrual
+    exp_c3 = (l3o - l2o) - (l3n - l2n) - 0.06 - 2 * FEE  # day2: intraday + exits
+    assert per3 == {"2026-09-17": round(exp_c1 * 1000, 2),
+                    "2026-09-18": round((exp_c2 + exp_c3) * 1000, 2)}, per3
+    print("OK  v2 carry per-day attribution:", per3)
 
     # --- skip rules ---
     # All Last-only -> snapshot unusable (no book anywhere).
