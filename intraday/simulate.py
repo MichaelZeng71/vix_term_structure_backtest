@@ -82,8 +82,19 @@ def normalize_label(label: str) -> str:
     """Map label variants ('OCT 2026', 'OCT 26', 'Oct') to 'Oct'.
 
     A few stored snapshots used Barchart-style labels; the engine works
-    with canonical three-letter month labels.
+    with canonical three-letter month labels. Barchart futures month codes
+    ('VIV26', 'VIX26', ..., VI root + month code + year) are decoded via
+    the standard futures month-code map so a mislabeled snapshot row can
+    never be silently dropped from the simulation.
     """
+    code_months = {c: name for name, c in
+                   zip(("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec").split(),
+                       "FGHJKMNQUVXZ")}
+    m = re.match(r"\s*VI([A-Z])\d+", label or "", re.IGNORECASE)
+    if m:
+        decoded = code_months.get(m.group(1).upper())
+        if decoded:
+            return decoded
     m = re.match(r"\s*([A-Za-z]+)", label or "")
     if not m:
         return label
