@@ -95,6 +95,12 @@ def normalize_label(label: str) -> str:
         decoded = code_months.get(m.group(1).upper())
         if decoded:
             return decoded
+    # ISO year-month labels as captured by some collector rows ('2026-10').
+    m = re.match(r"\s*(\d{4})-(\d{1,2})\b", label or "")
+    if m:
+        mn = int(m.group(2))
+        if 1 <= mn <= 12:
+            return ("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec").split()[mn - 1]
     m = re.match(r"\s*([A-Za-z]+)", label or "")
     if not m:
         return label
