@@ -68,8 +68,20 @@ def main() -> None:
                 ap.error(f"--curve['{label}'] must have numeric last/bid/ask")
             if not (last > 0 and bid > 0 and ask >= bid):
                 ap.error(f"--curve['{label}']: need last>0, bid>0, ask>=bid")
+            # Corruption guard (2026-10-06): the 06:34 PT scrape carried
+            # 8-9 tick-wide books and mixed dict/plain-float months with a
+            # VIX spot of 19.04 vs 15.36-15.45 three minutes either side.
+            # No legitimate row in the window has shown a book wider than
+            # 2 ticks; >5 ticks is a failed scrape, never a quote. Reject
+            # loudly instead of polluting the dataset.
+            if ask - bid > 0.25:
+                ap.error(f"--curve['{label}']: book spread {ask - bid:.2f} > 0.25 "
+                         f"points — corrupt scrape, refusing to record")
         elif not isinstance(v, (int, float)) or v <= 0:
             ap.error(f"--curve['{label}'] must be a positive price or a last/bid/ask object")
+    if any(isinstance(v, dict) for v in curve.values()) and \
+            any(not isinstance(v, dict) for v in curve.values()):
+        ap.error("--curve: mixed dict/plain-float months — corrupt scrape, refusing to record")
 
     db.upsert_snapshot(a.ts, a.vix, curve, a.source)
     appended = append_csv(a.ts, a.vix, curve)

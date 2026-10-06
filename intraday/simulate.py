@@ -231,6 +231,15 @@ def thesis_targets(snap: dict, band: float = 0.0):
     labels.sort(key=lambda lab: contract_ym(lab, snap_date))
     if not labels:
         return None, None
+    # Data-quality guard (2026-10-06): reject corrupt collector scrapes.
+    # The 2026-10-06 06:34 PT capture carried 8-9 tick-wide books
+    # (0.40/0.42) and a VIX spot of 19.04 vs 15.36-15.45 three minutes
+    # either side. No legitimate row in the window has shown a book wider
+    # than 2 ticks, so >5 ticks is corruption, never a quote.
+    for lab in labels:
+        q = _quote(norm_curve, lab)
+        if q is not None and (q[2] - q[1]) > 0.25:
+            return None, None
     lasts, dtms = [], []
     for lab in labels:
         lasts.append(_last(norm_curve, lab))

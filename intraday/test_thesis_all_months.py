@@ -211,6 +211,30 @@ def main():
     assert im["Nov"]["has_book"] is False
     print("OK  mixed book: only the quoted contract trades")
 
+    # --- corruption guard (2026-10-06) ---
+    # 8-9 tick-wide books are a failed scrape, never a quote: the snapshot
+    # must be rejected outright, even with a book on every month.
+    day = date.fromisoformat("2026-10-06")
+    corrupt = {"ts_pt": "2026-10-06T06:34:16-07:00", "vix": 19.04,
+               "curve": {}, "source": "synthetic"}
+    for lab in ("Oct", "Nov"):
+        last = exact_last(day, lab)
+        corrupt["curve"][lab] = {"last": last, "bid": last - 0.40,
+                                 "ask": last + 0.02}  # 8.4 ticks wide
+    assert thesis_targets(corrupt) == (None, None)
+    r = run_v2([corrupt])
+    assert r["n_snaps"] == 0 and "skipped" in r["note"], r
+    # Legit 2-tick books (widest seen in 21 days of real captures) still pass.
+    legit = {"ts_pt": "2026-10-06T06:37:11-07:00", "vix": SPOT,
+             "curve": {}, "source": "synthetic"}
+    for lab in ("Oct", "Nov"):
+        last = exact_last(day, lab)
+        legit["curve"][lab] = {"last": last, "bid": last - 0.03,
+                               "ask": last + 0.07}  # 2 ticks wide
+    tl, _ = thesis_targets(legit)
+    assert tl is not None and tl == {"Oct": 0, "Nov": 0}, tl
+    print("OK  corruption guard: 8-tick book rejected, 2-tick book accepted")
+
     print("\nALL ALL-MONTHS VALIDATION CHECKS PASSED")
 
 
